@@ -5,6 +5,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"golang.org/x/xerrors"
@@ -14,6 +15,24 @@ import (
 	"github.com/filecoin-project/sector-storage/sealtasks"
 	"github.com/filecoin-project/sector-storage/storiface"
 )
+
+type schedPrioCtxKey int
+
+var SchedPriorityKey schedPrioCtxKey
+var DefaultSchedPriority = 0
+
+func getPriority(ctx context.Context) int {
+	sp := ctx.Value(SchedPriorityKey)
+	if p, ok := sp.(int); ok {
+		return p
+	}
+
+	return DefaultSchedPriority
+}
+
+func WithPriority(ctx context.Context, priority int) context.Context {
+	return context.WithValue(ctx, SchedPriorityKey, priority)
+}
 
 const mib = 1 << 20
 
@@ -71,6 +90,7 @@ func (sh *scheduler) Schedule(ctx context.Context, sector abi.SectorID, taskType
 	case sh.schedule <- &workerRequest{
 		sector:   sector,
 		taskType: taskType,
+		priority: getPriority(ctx),
 		sel:      sel,
 
 		prepare: prepare,
@@ -98,6 +118,7 @@ func (sh *scheduler) Schedule(ctx context.Context, sector abi.SectorID, taskType
 type workerRequest struct {
 	sector   abi.SectorID
 	taskType sealtasks.TaskType
+	priority int // larger values more important
 	sel      WorkerSelector
 
 	prepare WorkerAction
@@ -204,6 +225,8 @@ func (sh *scheduler) onWorkerFreed(wid WorkerID) {
 	}
 }
 
+var selectorTimeout = 5 * time.Second
+
 func (sh *scheduler) maybeSchedRequest(req *workerRequest) (bool, error) {
 	sh.workersLk.Lock()
 	defer sh.workersLk.Unlock()
@@ -214,7 +237,10 @@ func (sh *scheduler) maybeSchedRequest(req *workerRequest) (bool, error) {
 	needRes := ResourceTable[req.taskType][sh.spt]
 
 	for wid, worker := range sh.workers {
-		ok, err := req.sel.Ok(req.ctx, req.taskType, sh.spt, worker)
+		rpcCtx, cancel := context.WithTimeout(req.ctx, selectorTimeout)
+		ok, err := req.sel.Ok(rpcCtx, req.taskType, sh.spt, worker)
+		cancel()
+
 		if err != nil {
 			return false, err
 		}
@@ -236,7 +262,10 @@ func (sh *scheduler) maybeSchedRequest(req *workerRequest) (bool, error) {
 			var serr error
 
 			sort.SliceStable(acceptable, func(i, j int) bool {
-				r, err := req.sel.Cmp(req.ctx, req.taskType, sh.workers[acceptable[i]], sh.workers[acceptable[j]])
+				rpcCtx, cancel := context.WithTimeout(req.ctx, selectorTimeout)
+				defer cancel()
+				r, err := req.sel.Cmp(rpcCtx, req.taskType, sh.workers[acceptable[i]], sh.workers[acceptable[j]])
+
 				if err != nil {
 					serr = multierror.Append(serr, err)
 				}
