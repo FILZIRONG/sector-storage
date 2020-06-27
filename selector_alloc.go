@@ -63,3 +63,49 @@ func (s *allocSelector) Cmp(ctx context.Context, task sealtasks.TaskType, a, b *
 }
 
 var _ WorkerSelector = &allocSelector{}
+
+//===================添加的内容====================//
+func (s *allocSelector) FindDataWoker(ctx context.Context, task sealtasks.TaskType, sid abi.SectorID, whnd *workerHandle) bool {
+	paths, err := whnd.w.Paths(ctx)
+	if err != nil {
+		return false
+	}
+
+	have := map[stores.ID]struct{}{}
+	for _, path := range paths {
+		have[path.ID] = struct{}{}
+	}
+
+	var ft stores.SectorFileType
+	switch task {
+	case sealtasks.TTAddPiece:
+		ft = 0
+	case sealtasks.TTPreCommit1:
+		ft = stores.FTUnsealed
+	case sealtasks.TTPreCommit2:
+		ft = stores.FTCache | stores.FTSealed
+	case sealtasks.TTCommit1:
+		ft = stores.FTCache | stores.FTSealed
+	case sealtasks.TTCommit2:
+		ft = stores.FTCache | stores.FTSealed
+	case sealtasks.TTFetch:
+		ft = stores.FTUnsealed | stores.FTCache | stores.FTSealed
+	case sealtasks.TTFinalize:
+		ft = stores.FTCache | stores.FTSealed
+	}
+
+	find, err := s.index.StorageFindSector(ctx, sid, ft, false)
+	if err != nil {
+		return false
+	}
+
+	for _, info := range find {
+		if _, ok := have[info.ID]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+//===================添加的内容====================//

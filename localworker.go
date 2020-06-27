@@ -266,7 +266,8 @@ func (l *LocalWorker) Info(context.Context) (storiface.WorkerInfo, error) {
 	}
 
 	return storiface.WorkerInfo{
-		Hostname: hostname,
+		Hostname:      hostname,
+		TaskResources: storiface.NewTaskLimitConfig("tasklimit.json"), // 添加的内容
 		Resources: storiface.WorkerResources{
 			MemPhysical: mem.Total,
 			MemSwap:     mem.VirtualTotal,

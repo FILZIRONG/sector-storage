@@ -41,7 +41,8 @@ type WorkerAction func(ctx context.Context, w Worker) error
 type WorkerSelector interface {
 	Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, a *workerHandle) (bool, error) // true if worker is acceptable for performing a task
 
-	Cmp(ctx context.Context, task sealtasks.TaskType, a, b *workerHandle) (bool, error) // true if a is preferred over b
+	Cmp(ctx context.Context, task sealtasks.TaskType, a, b *workerHandle) (bool, error)                 // true if a is preferred over b
+	FindDataWoker(ctx context.Context, task sealtasks.TaskType, sid abi.SectorID, a *workerHandle) bool // 添加的内容
 }
 
 type scheduler struct {
@@ -227,7 +228,7 @@ func (sh *scheduler) onWorkerFreed(wid WorkerID) {
 
 var selectorTimeout = 5 * time.Second
 
-func (sh *scheduler) maybeSchedRequest(req *workerRequest) (bool, error) {
+func (sh *scheduler) maybeSchedRequest0(req *workerRequest) (bool, error) {
 	sh.workersLk.Lock()
 	defer sh.workersLk.Unlock()
 
@@ -293,6 +294,8 @@ func (sh *scheduler) assignWorker(wid WorkerID, w *workerHandle, req *workerRequ
 	w.preparing.add(w.info.Resources, needRes)
 
 	go func() {
+		sh.taskAddOne(wid, req.taskType)          //添加的内容
+		defer sh.taskReduceOne(wid, req.taskType) //添加的内容
 		err := req.prepare(req.ctx, w.w)
 		sh.workersLk.Lock()
 
@@ -351,22 +354,9 @@ func (sh *scheduler) assignWorker(wid WorkerID, w *workerHandle, req *workerRequ
 }
 
 func (a *activeResources) withResources(spt abi.RegisteredSealProof, id WorkerID, wr storiface.WorkerResources, r Resources, locker sync.Locker, cb func() error) error {
-	for !canHandleRequest(r, spt, id, wr, a) {
-		if a.cond == nil {
-			a.cond = sync.NewCond(locker)
-		}
-		a.cond.Wait()
-	}
-
 	a.add(wr, r)
-
 	err := cb()
-
 	a.free(wr, r)
-	if a.cond != nil {
-		a.cond.Broadcast()
-	}
-
 	return err
 }
 
@@ -505,3 +495,189 @@ func (sh *scheduler) Close() error {
 	close(sh.closing)
 	return nil
 }
+
+//===================添加的内容====================//
+func (sh *scheduler) maybeSchedRequest(req *workerRequest) (bool, error) {
+	sh.workersLk.Lock()
+	defer sh.workersLk.Unlock()
+
+	tried := 0
+	var acceptable []WorkerID
+	var freetable []int   // 添加的内容
+	workerOnFree := false // 添加的内容
+	best := 0             // 添加的内容
+	for wid, worker := range sh.workers {
+		ok, err := req.sel.Ok(req.ctx, req.taskType, sh.spt, worker)
+		if err != nil {
+			return false, err
+		}
+
+		if !ok {
+			continue
+		}
+		tried++
+
+		freecount := sh.canHandleRequestWithTaskCount(wid, req.taskType) // 修改的内容
+		if freecount <= 0 {                                              // 修改的内容
+			continue
+		}
+		freetable = append(freetable, freecount) // 修改的内容
+		acceptable = append(acceptable, wid)
+
+		if onfree := req.sel.FindDataWoker(req.ctx, req.taskType, req.sector, worker); onfree {
+			workerOnFree = true
+			break
+		}
+	}
+
+	if len(acceptable) > 0 {
+		if workerOnFree {
+			best = len(acceptable) - 1
+		} else {
+			max := 0
+			for i, v := range freetable {
+				if v > max {
+					max = v
+					best = i
+				}
+			}
+		}
+		wid := acceptable[best]
+		whl := sh.workers[wid]
+		log.Infof("worker %s will be do the %+v jobTask!", whl.info.Hostname, req.taskType)
+		return true, sh.assignWorker(wid, whl, req)
+	}
+
+	if tried == 0 {
+		return false, xerrors.New("maybeSchedRequest didn't find any good workers")
+	}
+	return false, nil // put in waiting queue
+}
+
+func (sh *scheduler) taskAddOne(wid WorkerID, phaseTaskType sealtasks.TaskType) {
+	if whl, ok := sh.workers[wid]; ok {
+		whl.info.TaskResourcesLk.Lock()
+		defer whl.info.TaskResourcesLk.Unlock()
+		if counts, ok := whl.info.TaskResources[phaseTaskType]; ok {
+			counts.RunCount++
+		}
+	}
+}
+
+func (sh *scheduler) taskReduceOne(wid WorkerID, phaseTaskType sealtasks.TaskType) {
+	if whl, ok := sh.workers[wid]; ok {
+		whl.info.TaskResourcesLk.Lock()
+		defer whl.info.TaskResourcesLk.Unlock()
+		if counts, ok := whl.info.TaskResources[phaseTaskType]; ok {
+			counts.RunCount--
+		}
+	}
+}
+
+func (sh *scheduler) getTaskCount(wid WorkerID, phaseTaskType sealtasks.TaskType, typeCount string) int {
+	if whl, ok := sh.workers[wid]; ok {
+		if counts, ok := whl.info.TaskResources[phaseTaskType]; ok {
+			whl.info.TaskResourcesLk.Lock()
+			defer whl.info.TaskResourcesLk.Unlock()
+			if typeCount == "limit" {
+				return counts.LimitCount
+			}
+			if typeCount == "run" {
+				return counts.RunCount
+			}
+		}
+	}
+	return 0
+}
+
+func (sh *scheduler) canHandleRequestWithTaskCount(wid WorkerID, phaseTaskType sealtasks.TaskType) int {
+	// json文件限制的各阶段任务数量
+	addPieceLimitCount := sh.getTaskCount(wid, sealtasks.TTAddPiece, "limit")
+	p1LimitCount := sh.getTaskCount(wid, sealtasks.TTPreCommit1, "limit")
+	p2LimitCount := sh.getTaskCount(wid, sealtasks.TTPreCommit2, "limit")
+	c1LimitCount := sh.getTaskCount(wid, sealtasks.TTCommit1, "limit")
+	c2LimitCount := sh.getTaskCount(wid, sealtasks.TTCommit2, "limit")
+	fetchLimitCount := sh.getTaskCount(wid, sealtasks.TTFetch, "limit")
+	finalizeLimitCount := sh.getTaskCount(wid, sealtasks.TTFinalize, "limit")
+
+	// 运行中记录到的各阶段任务数量
+	addPieceCurrentCount := sh.getTaskCount(wid, sealtasks.TTAddPiece, "run")
+	p1CurrentCount := sh.getTaskCount(wid, sealtasks.TTPreCommit1, "run")
+	p2CurrentCount := sh.getTaskCount(wid, sealtasks.TTPreCommit2, "run")
+	c1CurrentCount := sh.getTaskCount(wid, sealtasks.TTCommit1, "run")
+	c2CurrentCount := sh.getTaskCount(wid, sealtasks.TTCommit2, "run")
+	// fetchCurrentCount := sh.getTaskCount(sealtasks.TTFetch, "run")
+	// finalizeCurrentCount := sh.getTaskCount(sealtasks.TTFinalize, "run")
+
+	whl := sh.workers[wid]
+	a2Free := p1LimitCount - addPieceCurrentCount - p1CurrentCount
+	b3Free := max(p2LimitCount, c1LimitCount, c2LimitCount) - p2CurrentCount - c1CurrentCount - c2CurrentCount
+	log.Infof("worker %s: free task count {(addpiece+p1):%d (p2+c1+c2):%d}", whl.info.Hostname, a2Free, b3Free)
+
+	if phaseTaskType == sealtasks.TTAddPiece {
+		if addPieceLimitCount == 0 { // 限制数量为0，表示禁用此阶段的任务工作
+			return 0
+		}
+		return a2Free // 返回前二个阶段的任务空闲数量
+	}
+
+	if phaseTaskType == sealtasks.TTPreCommit1 {
+		if p1LimitCount == 0 {
+			return 0
+		}
+		return a2Free // 返回前二个阶段的任务空闲数量
+	}
+
+	if phaseTaskType == sealtasks.TTPreCommit2 {
+		if p2LimitCount == 0 {
+			return 0
+		}
+		return b3Free // 返回后三个阶段的任务空闲数量
+	}
+
+	if phaseTaskType == sealtasks.TTCommit1 {
+		if c1LimitCount == 0 {
+			return 0
+		}
+		return b3Free // 返回后三个阶段的任务空闲数量
+	}
+
+	if phaseTaskType == sealtasks.TTCommit2 {
+		if c2LimitCount == 0 {
+			return 0
+		}
+		return b3Free // 返回后三个阶段的任务空闲数量
+	}
+
+	if phaseTaskType == sealtasks.TTFetch {
+		if fetchLimitCount == 0 {
+			return 0
+		}
+		return 1 // 这个阶段不应该限制，判断数据所在由本地去做
+	}
+
+	if phaseTaskType == sealtasks.TTFinalize {
+		if finalizeLimitCount == 0 {
+			return 0
+		}
+		return 1 // 这个阶段不应该限制，判断数据所在由本地去做
+	}
+	return 0
+}
+
+func max(a, b, c int) int {
+	var max int
+
+	if a > b {
+		max = a
+	} else {
+		max = b
+	}
+
+	if max > c {
+		return max
+	}
+	return c
+}
+
+//===================添加的内容====================//

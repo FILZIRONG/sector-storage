@@ -46,3 +46,36 @@ func (s *taskSelector) Cmp(ctx context.Context, _ sealtasks.TaskType, a, b *work
 }
 
 var _ WorkerSelector = &allocSelector{}
+
+//===================添加的内容====================//
+func (s *taskSelector) FindDataWoker(ctx context.Context, task sealtasks.TaskType, sid abi.SectorID, whnd *workerHandle) bool {
+	tasks, err := whnd.w.TaskTypes(ctx)
+	if err != nil {
+		return false
+	}
+	if _, supported := tasks[task]; !supported {
+		return false
+	}
+
+	paths, err := whnd.w.Paths(ctx)
+	if err != nil {
+		return false
+	}
+
+	have := map[stores.ID]struct{}{}
+	for _, path := range paths {
+		have[path.ID] = struct{}{}
+	}
+
+	for _, info := range s.best {
+		if info.Weight != 0 { // 为0的权重是fecth来的，不是本地的
+			if _, ok := have[info.ID]; ok {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+//===================添加的内容====================//
