@@ -610,7 +610,7 @@ func (sh *scheduler) canHandleRequestWithTaskCount(wid WorkerID, phaseTaskType s
 	// finalizeCurrentCount := sh.getTaskCount(sealtasks.TTFinalize, "run")
 
 	whl := sh.workers[wid]
-	p1Free := p1LimitCount - addPieceCurrentCount - p1CurrentCount
+	p1Free := p1LimitCount - p1CurrentCount
 	b3Free := max(p2LimitCount, c1LimitCount, c2LimitCount) - p2CurrentCount - c1CurrentCount - c2CurrentCount
 	log.Infof("worker %s: free task count {(p1):%d (p2+c1+c2):%d}", whl.info.Hostname, p1Free, b3Free)
 
@@ -618,14 +618,14 @@ func (sh *scheduler) canHandleRequestWithTaskCount(wid WorkerID, phaseTaskType s
 		if addPieceLimitCount == 0 { // 限制数量为0，表示禁用此阶段的任务工作
 			return 0
 		}
-		return addPieceLimitCount - addPieceCurrentCount
+		return 1 // 这个阶段不应该限制，判断数据所在由本地去做
 	}
 
 	if phaseTaskType == sealtasks.TTPreCommit1 {
 		if p1LimitCount == 0 {
 			return 0
 		}
-		return p1LimitCount - p1CurrentCount // 返回前二个阶段的任务空闲数量
+		return p1Free // 返回前二个阶段的任务空闲数量
 	}
 
 	if phaseTaskType == sealtasks.TTPreCommit2 {
