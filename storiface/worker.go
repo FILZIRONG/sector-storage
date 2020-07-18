@@ -76,7 +76,7 @@ func NewTaskLimitConfig(jsonname string) map[sealtasks.TaskType]*TaskConfig {
 			if _, err := os.Stat(jsonFile); err == nil { // 文件存在
 				configFileName = jsonFile
 			} else {
-				configFileName = filepath.Join("~/.lotusstorage/", jsonname)
+				configFileName = "~/.lotusstorage/" + jsonname
 			}
 		}
 	}
@@ -146,4 +146,5 @@ func NewTaskLimitConfig(jsonname string) map[sealtasks.TaskType]*TaskConfig {
 
 	return cfgResources
 }
+
 //===================添加的内容====================//
